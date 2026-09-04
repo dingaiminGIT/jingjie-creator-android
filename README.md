@@ -2,6 +2,12 @@
 
 这是根据现有 iOS 产品公开功能、真机界面和交互重新实现的 Android 原型，不包含原 iOS App 的源码，也没有绕过原 App 的会员校验。
 
+![镜界创作 Android 首页](docs/home.png)
+
+## 下载
+
+[下载 0.3.0 APK](https://github.com/dingaiminGIT/jingjie-creator-android/releases/download/v0.3.0/jingjie-creator-0.3.0.apk)
+
 ## 当前版本（0.3.0）
 
 - 首页、作品库入口、快速拍摄与场景卡片
