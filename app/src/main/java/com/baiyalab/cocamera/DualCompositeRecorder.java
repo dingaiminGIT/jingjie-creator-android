@@ -64,6 +64,7 @@ public final class DualCompositeRecorder {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService encoderExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean running = new AtomicBoolean();
+    private volatile long stopRequestedNs;
     private final Object frameLock = new Object();
     private Bitmap backFrame;
     private Bitmap frontFrame;
@@ -107,6 +108,7 @@ public final class DualCompositeRecorder {
     }
 
     public void stop() {
+        stopRequestedNs = System.nanoTime();
         running.set(false);
     }
 
@@ -155,8 +157,10 @@ public final class DualCompositeRecorder {
         MediaCodec audioCodec = null;
         AudioRecord audioRecord = null;
         boolean muxerStarted = false;
+        boolean audioRecordStopped = false;
         boolean audioEnabled = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED;
+        long timelineStartNs = System.nanoTime();
         try {
             ContentValues values = new ContentValues();
             values.put(MediaStore.Video.Media.DISPLAY_NAME, "JingJie_Dual_" +
@@ -183,8 +187,11 @@ public final class DualCompositeRecorder {
             if (audioEnabled) {
                 int minBuffer = AudioRecord.getMinBufferSize(AUDIO_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT);
+                // Keep about one second of capture headroom. CPU composition can
+                // occasionally occupy the encoder thread for tens of milliseconds.
+                int recordBufferBytes = Math.max(minBuffer * 4, AUDIO_RATE * 2);
                 audioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC, AUDIO_RATE,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, Math.max(minBuffer * 2, 8192));
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, recordBufferBytes);
                 if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
                     audioRecord.release();
                     audioRecord = null;
@@ -196,6 +203,7 @@ public final class DualCompositeRecorder {
                     audioCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
                     audioCodec.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                     audioCodec.start();
+                    timelineStartNs = System.nanoTime();
                     audioRecord.startRecording();
                 }
             }
@@ -205,9 +213,12 @@ public final class DualCompositeRecorder {
             int[] pixels = new int[WIDTH * HEIGHT];
             byte[] yuv = new byte[WIDTH * HEIGHT * 3 / 2];
             byte[] audioBytes = new byte[4096];
-            long nextFrameNs = System.nanoTime();
-            long videoFrameIndex = 0;
+            long frameIntervalNs = 1_000_000_000L / FRAME_RATE;
+            long nextFrameNs = timelineStartNs;
+            long lastVideoPtsUs = -1;
             long audioSamples = 0;
+            int pendingAudioOffset = 0;
+            int pendingAudioBytes = 0;
             int videoTrack = -1;
             int audioTrack = audioEnabled ? -1 : -2;
             boolean videoEosQueued = false;
@@ -218,7 +229,8 @@ public final class DualCompositeRecorder {
             MediaCodec.BufferInfo audioInfo = new MediaCodec.BufferInfo();
 
             while (!videoDone || !audioDone) {
-                if (running.get()) {
+                boolean captureRunning = running.get();
+                if (captureRunning) {
                     long now = System.nanoTime();
                     if (now >= nextFrameNs && hasBackFrame()) {
                         drawComposite(composite);
@@ -231,29 +243,13 @@ public final class DualCompositeRecorder {
                             if (input != null) {
                                 input.clear();
                                 input.put(yuv);
-                                long pts = videoFrameIndex * 1_000_000L / FRAME_RATE;
+                                // Preserve real elapsed capture time. A missed CPU
+                                // composition deadline must not stretch the video clock.
+                                long pts = Math.max(lastVideoPtsUs + 1,
+                                    (now - timelineStartNs) / 1_000L);
                                 videoCodec.queueInputBuffer(inputIndex, 0, yuv.length, pts, 0);
-                                videoFrameIndex++;
-                                nextFrameNs += 1_000_000_000L / FRAME_RATE;
-                                if (nextFrameNs < now - 200_000_000L) nextFrameNs = now;
-                            }
-                        }
-                    }
-
-                    if (audioEnabled && audioRecord != null && audioCodec != null) {
-                        int read = audioRecord.read(audioBytes, 0, audioBytes.length, AudioRecord.READ_NON_BLOCKING);
-                        if (read > 0) {
-                            int inputIndex = audioCodec.dequeueInputBuffer(0);
-                            if (inputIndex >= 0) {
-                                ByteBuffer input = audioCodec.getInputBuffer(inputIndex);
-                                if (input != null) {
-                                    input.clear();
-                                    int bytesToWrite = Math.min(read, input.remaining());
-                                    input.put(audioBytes, 0, bytesToWrite);
-                                    long pts = audioSamples * 1_000_000L / AUDIO_RATE;
-                                    audioCodec.queueInputBuffer(inputIndex, 0, bytesToWrite, pts, 0);
-                                    audioSamples += bytesToWrite / 2;
-                                }
+                                lastVideoPtsUs = pts;
+                                nextFrameNs = Math.max(nextFrameNs + frameIntervalNs, System.nanoTime());
                             }
                         }
                     }
@@ -261,12 +257,73 @@ public final class DualCompositeRecorder {
                     if (!videoEosQueued) {
                         int inputIndex = videoCodec.dequeueInputBuffer(10_000);
                         if (inputIndex >= 0) {
+                            long stopNs = stopRequestedNs > 0 ? stopRequestedNs : System.nanoTime();
+                            long videoEosPtsUs = Math.max(lastVideoPtsUs + 1,
+                                (stopNs - timelineStartNs) / 1_000L);
                             videoCodec.queueInputBuffer(inputIndex, 0, 0,
-                                videoFrameIndex * 1_000_000L / FRAME_RATE, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                                videoEosPtsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                             videoEosQueued = true;
                         }
                     }
-                    if (audioEnabled && !audioEosQueued && audioCodec != null) {
+                }
+
+                if (audioEnabled && audioRecord != null && audioCodec != null && !audioEosQueued) {
+                    long targetSamples = Long.MAX_VALUE;
+                    if (!captureRunning) {
+                        long stopNs = stopRequestedNs > 0 ? stopRequestedNs : System.nanoTime();
+                        targetSamples = Math.max(audioSamples,
+                            (stopNs - timelineStartNs) * AUDIO_RATE / 1_000_000_000L);
+                    }
+
+                    // Retain PCM until an AAC input buffer is available. Previously
+                    // a whole microphone chunk was discarded whenever the codec was
+                    // briefly busy, which continuously shortened the audio track.
+                    if (pendingAudioBytes == 0 && audioSamples < targetSamples) {
+                        int bytesToRead = audioBytes.length;
+                        if (!captureRunning) {
+                            long remainingBytes = (targetSamples - audioSamples) * 2L;
+                            bytesToRead = (int) Math.min(bytesToRead, remainingBytes);
+                        }
+                        int read = bytesToRead > 0
+                            ? audioRecord.read(audioBytes, 0, bytesToRead, AudioRecord.READ_NON_BLOCKING) : 0;
+                        if (read > 0) {
+                            pendingAudioOffset = 0;
+                            pendingAudioBytes = read - (read & 1);
+                        }
+                    }
+
+                    if (pendingAudioBytes > 0) {
+                        int inputIndex = audioCodec.dequeueInputBuffer(0);
+                        if (inputIndex >= 0) {
+                            ByteBuffer input = audioCodec.getInputBuffer(inputIndex);
+                            if (input != null) {
+                                input.clear();
+                                int bytesToWrite = Math.min(pendingAudioBytes, input.remaining());
+                                if (!captureRunning) {
+                                    long remainingBytes = (targetSamples - audioSamples) * 2L;
+                                    bytesToWrite = (int) Math.min(bytesToWrite, Math.max(0L, remainingBytes));
+                                }
+                                if (bytesToWrite > 0) {
+                                    input.put(audioBytes, pendingAudioOffset, bytesToWrite);
+                                    long pts = audioSamples * 1_000_000L / AUDIO_RATE;
+                                    audioCodec.queueInputBuffer(inputIndex, 0, bytesToWrite, pts, 0);
+                                    audioSamples += bytesToWrite / 2;
+                                    pendingAudioOffset += bytesToWrite;
+                                    pendingAudioBytes -= bytesToWrite;
+                                } else {
+                                    audioCodec.queueInputBuffer(inputIndex, 0, 0,
+                                        audioSamples * 1_000_000L / AUDIO_RATE, 0);
+                                    pendingAudioBytes = 0;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!captureRunning && audioSamples >= targetSamples && pendingAudioBytes == 0) {
+                        if (!audioRecordStopped) {
+                            audioRecord.stop();
+                            audioRecordStopped = true;
+                        }
                         int inputIndex = audioCodec.dequeueInputBuffer(10_000);
                         if (inputIndex >= 0) {
                             audioCodec.queueInputBuffer(inputIndex, 0, 0,
@@ -291,7 +348,7 @@ public final class DualCompositeRecorder {
                 if (running.get()) Thread.sleep(2);
             }
 
-            if (audioRecord != null) audioRecord.stop();
+            if (audioRecord != null && !audioRecordStopped) audioRecord.stop();
             if (muxerStarted) muxer.stop();
             ContentValues ready = new ContentValues();
             ready.put(MediaStore.Video.Media.IS_PENDING, 0);

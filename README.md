@@ -6,14 +6,15 @@
 
 ## 下载
 
-[下载 0.3.0 APK](https://github.com/dingaiminGIT/jingjie-creator-android/releases/download/v0.3.0/jingjie-creator-0.3.0.apk)
+[下载 0.3.1 APK](https://github.com/dingaiminGIT/jingjie-creator-android/releases/download/v0.3.1/jingjie-creator-0.3.1.apk)
 
-## 当前版本（0.3.0）
+## 当前版本（0.3.1）
 
 - 首页、作品库入口、快速拍摄与场景卡片
 - 去重后的 7 个差异化场景：运动·旅行双摄、15 秒预录、提词拍摄、现场讲解、探店测评、开箱展示、访谈对话
 - 单摄拍照与不限时长录像，支持前后切换、点按对焦、变焦、补光灯、网格
 - 前后双摄照片与录像真实合成，支持画中画、左右均分、上下均分
+- 双摄录像的画面与麦克风共用单调时间轴；AAC 忙时保留待编码 PCM，避免长录制音轨逐渐缩短
 - 所有双摄布局可互换前后摄主副画面；录像中也可实时切换，不会断开文件
 - 画中画可自由拖动，拖动后的位置会同步写入照片和最终 MP4
 - 15 秒循环预录：保留按键前最多 15 秒并与后续录像拼接
